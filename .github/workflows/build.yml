@@ -30,7 +30,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y podman buildah skopeo jq runc
+          sudo apt-get install -y podman buildah skopeo jq runc zstd
           mkdir -p ~/.config/containers
           printf '[engine]\nruntime = "runc"\n' > ~/.config/containers/containers.conf
       - name: Authenticate package downloads
@@ -64,24 +64,60 @@ jobs:
           expected=$(grep -c '^ARG [A-Z0-9_]*_REF$' Containerfile)
           actual=$(grep -c '_REF=' "$RUNNER_TEMP/package-refs.env")
           test "$expected" -eq "$actual"
-          podman build --platform linux/arm64 --format oci --target armada-rootfs \
+          base_digest=$(skopeo inspect --override-arch arm64 --format '{{.Digest}}' docker://quay.io/fedora/fedora-bootc:44)
+          base_image="quay.io/fedora/fedora-bootc@$base_digest"
+          config=$(skopeo inspect --override-arch arm64 --config "docker://$base_image" |
+            jq -c --arg version "$VERSION" --arg revision "$GITHUB_SHA" '
+              .config |
+              .Labels = ((.Labels // {}) + {
+                "org.opencontainers.image.version": $version,
+                "org.opencontainers.image.revision": $revision,
+                "containers.bootc": "1"
+              }) |
+              del(.Labels["ostree.commit"]) |
+              del(.Labels["ostree.final-diffid"])')
+          printf '%s\n' "$config" > "$RUNNER_TEMP/chunkah-config.json"
+          # 与原项目一致，保留 RUN --mount 引用的根文件系统阶段，再由 Chunkah 输出 OCI。
+          buildah build --platform linux/arm64 --format docker --target chunkah \
+            --skip-unused-stages=false --volume "$RUNNER_TEMP:/run/src" \
+            --storage-opt overlay.mount_program= \
             --security-opt label=disable \
             --build-arg "ARMADA_VERSION=$VERSION" \
+            --build-arg "BASE_IMAGE=$base_image" \
+            --build-arg "CHUNKAH_CONFIG_STR=$config" \
             --build-arg-file "$RUNNER_TEMP/package-refs.env" \
             --secret "id=decky_releases,src=$RUNNER_TEMP/decky-releases.json" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --label "org.opencontainers.image.version=$VERSION" \
             --label containers.bootc=1 \
             -t localhost/y700-personal:build .
-          podman run --rm --entrypoint /bin/sh localhost/y700-personal:build -c 'uname -m; test -e /usr/lib/armada/devices/lenovo-tb323fu.conf'
+      - name: Validate normalized OCI output
+        run: |
+          set -euo pipefail
+          for component in steam proton fex-rootfs; do
+            grep -Eq "creating tar layer .*\"xattr/${component}\"" "$RUNNER_TEMP/chunkah.log"
+          done
+          skopeo inspect --raw "oci:$RUNNER_TEMP/chunked" > "$RUNNER_TEMP/chunkah-manifest.json"
+          jq -e '(.layers | length) > 1 and (.layers | length) <= 128 and
+            (((.annotations // {}) | has("ostree.commit")) | not) and
+            (((.annotations // {}) | has("ostree.final-diffid")) | not)' "$RUNNER_TEMP/chunkah-manifest.json"
+          skopeo inspect --config "oci:$RUNNER_TEMP/chunked" > "$RUNNER_TEMP/chunkah-image-config.json"
+          jq -e --slurpfile expected "$RUNNER_TEMP/chunkah-config.json" '.config == $expected[0]' "$RUNNER_TEMP/chunkah-image-config.json"
+          jq -e '.architecture == "arm64" and .os == "linux" and
+            .config.Cmd == ["/sbin/init"] and
+            .config.Labels["containers.bootc"] == "1" and
+            .config.Labels["ostree.bootable"] == "true" and
+            ((.config.Labels | has("ostree.commit")) | not) and
+            ((.config.Labels | has("ostree.final-diffid")) | not)' "$RUNNER_TEMP/chunkah-image-config.json"
+          python3 build_files/verify-steam-bootstrap.py --oci "$RUNNER_TEMP/chunked"
       - name: Publish personal build for EDL packaging
         id: publish
         run: |
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY,,}:personal-${GITHUB_SHA}"
-          podman push --digestfile "$RUNNER_TEMP/image-digest" localhost/y700-personal:build "docker://$image"
+          skopeo copy --all "oci:$RUNNER_TEMP/chunked" "docker://$image"
           echo "image=$image" >> "$GITHUB_OUTPUT"
-          echo "digest=$(cat "$RUNNER_TEMP/image-digest")" >> "$GITHUB_OUTPUT"
+          echo "digest=$(skopeo inspect --format '{{.Digest}}' "docker://$image")" >> "$GITHUB_OUTPUT"
 
   edl:
     name: Package TB323FU installer bundle
